@@ -14,7 +14,9 @@ export default function Dashboard() {
     const { data: session, status } = useSession()
     const router = useRouter()
     const [messages, setMessages] = useState([])
-    const [loading, setLoading] = useState(true)
+    const [loading, setLoading] = useState(false)
+    const [syncing, setSyncing] = useState(false)
+    const [lastSync, setLastSync] = useState(null)
 
     useEffect(() => {
         if (status === "unauthenticated") {
@@ -24,27 +26,45 @@ export default function Dashboard() {
 
     useEffect(() => {
         if (session?.user?.id) {
+            // Only fetch messages on initial load, don't auto-sync
             fetchMessages()
-            const interval = setInterval(fetchMessages, 15000) // 30 seconds
-            return () => clearInterval(interval)
         }
     }, [session])
 
     const fetchMessages = async () => {
         try {
             setLoading(true)
+            console.log('📥 Fetching messages from database...')
 
-            // First sync new messages
-            await fetch('/api/sync-messages', { method: 'POST' })
-
-            // Then fetch all messages
+            // Only fetch existing messages, don't sync new ones automatically
             const response = await fetch('/api/messages')
             const data = await response.json()
             setMessages(data.messages || [])
+            console.log(`📥 Loaded ${data.messages?.length || 0} messages from database`)
         } catch (error) {
             console.error('Error fetching messages:', error)
         } finally {
             setLoading(false)
+        }
+    }
+
+    const syncMessages = async () => {
+        try {
+            setSyncing(true)
+            console.log('🔄 Manual sync triggered...')
+
+            // First sync new messages
+            const syncResponse = await fetch('/api/sync-messages', { method: 'POST' })
+            const syncData = await syncResponse.json()
+            console.log('Sync result:', syncData)
+
+            // Then fetch all messages
+            await fetchMessages()
+            setLastSync(new Date())
+        } catch (error) {
+            console.error('Error syncing messages:', error)
+        } finally {
+            setSyncing(false)
         }
     }
 
@@ -128,6 +148,15 @@ export default function Dashboard() {
                     </Card>
                 ) : (
                     <div className="space-y-6">
+                        {/* Sync Status */}
+                        {lastSync && (
+                            <Alert>
+                                <AlertDescription>
+                                    Last synced: {lastSync.toLocaleTimeString()}
+                                </AlertDescription>
+                            </Alert>
+                        )}
+
                         {/* Messages Card */}
                         <Card>
                             <CardHeader>
@@ -138,14 +167,25 @@ export default function Dashboard() {
                                             Your latest messages from connected platforms
                                         </CardDescription>
                                     </div>
-                                    <Button
-                                        onClick={fetchMessages}
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={loading}
-                                    >
-                                        {loading ? "Loading..." : "Refresh"}
-                                    </Button>
+                                    <div className="flex space-x-2">
+                                        <Button
+                                            onClick={fetchMessages}
+                                            variant="outline"
+                                            size="sm"
+                                            disabled={loading}
+                                        >
+                                            {loading ? "Loading..." : "Refresh"}
+                                        </Button>
+                                        <Button
+                                            onClick={syncMessages}
+                                            variant="default"
+                                            size="sm"
+                                            disabled={syncing}
+                                            className="bg-blue-600 hover:bg-blue-700"
+                                        >
+                                            {syncing ? "Syncing..." : "Sync New"}
+                                        </Button>
+                                    </div>
                                 </div>
                             </CardHeader>
 
@@ -157,11 +197,18 @@ export default function Dashboard() {
                                 ) : messages.length === 0 ? (
                                     <Alert>
                                         <AlertDescription>
-                                            No messages yet. Messages will appear here once your webhooks are set up and you start receiving notifications.
+                                            No messages yet. Click "Sync New" to fetch your latest messages from connected platforms.
+                                            <br />
+                                            <small className="text-slate-500 mt-2 block">
+                                                Note: Due to API rate limits, syncing may take a moment and only fetches a few recent messages.
+                                            </small>
                                         </AlertDescription>
                                     </Alert>
                                 ) : (
                                     <div className="space-y-4">
+                                        <div className="text-sm text-slate-600 mb-4">
+                                            Showing {messages.length} message(s)
+                                        </div>
                                         {messages.map((message, index) => (
                                             <div key={message.id}>
                                                 <div className="flex items-start space-x-3 p-4 hover:bg-slate-50 rounded-lg transition-colors">

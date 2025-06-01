@@ -5,7 +5,6 @@ export class MessageService {
         try {
             console.log('🔍 Starting Slack message fetch for user:', userId)
 
-
             // Get user's Slack access token
             const slackAccount = await prisma.account.findFirst({
                 where: {
@@ -19,14 +18,26 @@ export class MessageService {
                 return []
             }
 
-            console.log("Slack access token:", slackAccount.access_token)
+            console.log('🔑 Slack account found')
+            console.log('🔑 Bot token:', slackAccount.access_token?.substring(0, 10) + '...')
+            console.log('🔑 User token:', slackAccount.refresh_token?.substring(0, 10) + '...' || 'not found')
+            console.log('🔑 Scopes:', slackAccount.scope)
 
-            console.log('✅ Found Slack account, token starts with:', slackAccount.access_token.substring(0, 10) + '...')
+            // Use the user token stored in refresh_token field for API calls
+            // (We store it there because Slack doesn't use refresh tokens)
+            let userToken = slackAccount.refresh_token || slackAccount.access_token
 
-            // Test the token first
+            if (!userToken) {
+                console.error('❌ No token available')
+                return []
+            }
+
+            console.log('🔑 Using token type:', userToken.startsWith('xoxp-') ? 'user token' : 'bot token')
+
+            // Test the token with auth.test to see what scopes it has
             const testResponse = await fetch('https://slack.com/api/auth.test', {
                 headers: {
-                    'Authorization': `Bearer ${slackAccount.access_token}`,
+                    'Authorization': `Bearer ${userToken}`,
                     'Content-Type': 'application/json'
                 }
             })
@@ -39,17 +50,38 @@ export class MessageService {
                 return []
             }
 
-            // Fetch conversations
-            console.log('📋 Fetching Slack conversations...')
-            const conversationsResponse = await fetch('https://slack.com/api/conversations.list?types=public_channel,private_channel,mpim,im', {
+            // Make a test call to conversations.list to check scopes
+            console.log('🧪 Testing conversations.list to check scopes...')
+            const scopeTestResponse = await fetch('https://slack.com/api/conversations.list?limit=1', {
                 headers: {
-                    'Authorization': `Bearer ${slackAccount.access_token}`,
+                    'Authorization': `Bearer ${userToken}`,
+                    'Content-Type': 'application/json'
+                }
+            })
+
+            const scopeTest = await scopeTestResponse.json()
+            console.log('🧪 Scope test result:', scopeTest)
+
+            if (!scopeTest.ok) {
+                console.error('❌ Scope test failed:', scopeTest.error)
+                console.error('❌ Needed:', scopeTest.needed)
+                console.error('❌ Provided:', scopeTest.provided)
+                return []
+            }
+
+            // If we get here, the token works for conversations.list
+            console.log('✅ Token has correct scopes!')
+
+            // Fetch conversations - limit to reduce API calls
+            console.log('📋 Fetching Slack conversations...')
+            const conversationsResponse = await fetch('https://slack.com/api/conversations.list?types=public_channel&limit=3', {
+                headers: {
+                    'Authorization': `Bearer ${userToken}`,
                     'Content-Type': 'application/json'
                 }
             })
 
             const conversations = await conversationsResponse.json()
-            console.log('📋 Conversations response:', JSON.stringify(conversations, null, 2))
 
             if (!conversations.ok) {
                 console.error('❌ Slack conversations error:', conversations.error)
@@ -60,39 +92,41 @@ export class MessageService {
 
             const messages = []
 
-            // Fetch messages from each conversation
-            const channelsToCheck = conversations.channels?.slice(0, 3) || [] // Check first 3 channels
+            // Only fetch from 1 channel to avoid rate limits
+            const channelsToCheck = conversations.channels?.slice(0, 1) || []
 
-            for (const channel of channelsToCheck) {
+            for (let i = 0; i < channelsToCheck.length; i++) {
+                const channel = channelsToCheck[i]
                 console.log(`💬 Fetching messages from channel: ${channel.name || channel.id}`)
 
                 try {
-                    const historyResponse = await fetch(`https://slack.com/api/conversations.history?channel=${channel.id}&limit=5`, {
+                    // Add delay even before first API call
+                    console.log('⏳ Waiting 2 seconds to avoid rate limits...')
+                    await new Promise(resolve => setTimeout(resolve, 2000))
+
+                    const historyResponse = await fetch(`https://slack.com/api/conversations.history?channel=${channel.id}&limit=2`, {
                         headers: {
-                            'Authorization': `Bearer ${slackAccount.access_token}`,
+                            'Authorization': `Bearer ${userToken}`,
                             'Content-Type': 'application/json'
                         }
                     })
 
                     const history = await historyResponse.json()
-                    console.log(`💬 History for ${channel.name}:`, JSON.stringify(history, null, 2))
 
                     if (history.ok && history.messages) {
-                        console.log(`💬 Found ${history.messages.length} messages in ${channel.name}`)
+                        console.log(`💬 Found ${history.messages.length} messages in ${channel.name || channel.id}`)
 
                         for (const message of history.messages) {
-                            console.log('📝 Processing message:', {
-                                text: message.text,
-                                user: message.user,
-                                ts: message.ts,
-                                bot_id: message.bot_id
-                            })
-
                             // Skip bot messages and messages without text
                             if (message.bot_id || !message.text) {
-                                console.log('⏭️  Skipping message (bot or no text)')
                                 continue
                             }
+
+                            console.log('📝 Processing message:', {
+                                text: message.text.substring(0, 30) + '...',
+                                user: message.user,
+                                ts: message.ts
+                            })
 
                             // Check if we already have this message
                             const existingMessage = await prisma.message.findFirst({
@@ -103,7 +137,7 @@ export class MessageService {
                             })
 
                             if (!existingMessage) {
-                                console.log('✨ New message found, will save:', message.text)
+                                console.log('✨ New message found, adding to save queue')
                                 messages.push({
                                     userId: userId,
                                     platform: 'slack',
@@ -114,11 +148,15 @@ export class MessageService {
                                     threadId: message.thread_ts || null
                                 })
                             } else {
-                                console.log('⏭️  Message already exists:', message.ts)
+                                console.log('⏭️  Message already exists in database')
                             }
                         }
                     } else {
-                        console.log('❌ No messages or error:', history.error)
+                        console.log('❌ History error for channel:', history.error)
+                        if (history.error === 'ratelimited') {
+                            console.log('⏳ Rate limited - stopping message fetch for now')
+                            break // Stop fetching more channels if we hit rate limits
+                        }
                     }
                 } catch (channelError) {
                     console.error('❌ Error fetching channel messages:', channelError)
@@ -128,11 +166,15 @@ export class MessageService {
             // Save new messages to database
             if (messages.length > 0) {
                 console.log(`💾 Saving ${messages.length} new messages to database`)
-                const savedMessages = await prisma.message.createMany({
-                    data: messages,
-                    skipDuplicates: true
-                })
-                console.log('✅ Messages saved successfully:', savedMessages)
+                try {
+                    const savedMessages = await prisma.message.createMany({
+                        data: messages,
+                        skipDuplicates: true
+                    })
+                    console.log('✅ Messages saved successfully')
+                } catch (saveError) {
+                    console.error('❌ Error saving messages:', saveError)
+                }
             } else {
                 console.log('📭 No new messages to save')
             }
@@ -190,7 +232,6 @@ export class MessageService {
             })
 
             const notifications = await response.json()
-            console.log('🔔 GitHub notifications response:', JSON.stringify(notifications, null, 2))
 
             if (!Array.isArray(notifications)) {
                 console.error('❌ GitHub notifications error:', notifications)
@@ -202,12 +243,6 @@ export class MessageService {
             const messages = []
 
             for (const notification of notifications.slice(0, 5)) {
-                console.log('📝 Processing notification:', {
-                    title: notification.subject.title,
-                    type: notification.subject.type,
-                    repo: notification.repository.full_name
-                })
-
                 // Check if we already have this notification
                 const existingMessage = await prisma.message.findFirst({
                     where: {
@@ -227,8 +262,6 @@ export class MessageService {
                         messageId: notification.id,
                         threadId: null
                     })
-                } else {
-                    console.log('⏭️  Notification already exists:', notification.id)
                 }
             }
 
